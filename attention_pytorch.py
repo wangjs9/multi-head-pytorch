@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Attention(nn.Module):
     def __init__(self, in_feature, num_head, device, mask_right=False):
@@ -43,38 +44,45 @@ class Attention(nn.Module):
 
         return x.squeeze(1)
 
-class TextSentiment(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_class):
+class TextCNN(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_class, num_filters=3, filter_sizes=[2,3,4]):
         super().__init__()
-        self.embedding = nn.EmbeddingBag(vocab_size, embed_dim, sparse=True)
-        self.fc = nn.Linear(embed_dim, num_class)
-        self.init_weights()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, sparse=False)
+        self.convs = nn.ModuleList(
+            [nn.Conv2d(1, num_filters, (k, embed_dim)) for k in filter_sizes]
+        )
+        self.fc = nn.Linear(num_filters * len(filter_sizes), num_class)
 
-    def init_weights(self):
-        initrange = 0.5
-        self.embedding.weight.data.uniform_(-initrange, initrange)
-        self.fc.weight.data.uniform_(-initrange, initrange)
-        self.fc.bias.data.zero_()
+    def conv_and_pool(self, x, conv):
+        x = F.relu(conv(x)).squeeze(3)
+        x = F.max_pool1d(x, x.size(2)).squeeze(2)
+        return x
 
-    def forward(self, text, offsets):
-        embedded = self.embedding(text, offsets)
-        return self.fc(embedded)
+    def forward(self, text):
+        embedded = self.embedding(text[0])
+        embedded = embedded.unsqueeze(1)
+        out = torch.cat([self.conv_and_pool(embedded, conv) for conv in self.convs], 1)
+        return self.fc(out)
 
-class TextSentiment_attn(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_class, device):
+class TextCNN_attn(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_class, device, num_filters=3, filter_sizes=[2,3,4]):
         super().__init__()
-        self.embedding = nn.EmbeddingBag(vocab_size, embed_dim, sparse=True)
-        self.attn = Attention(embed_dim, 8, device)
-        self.fc = nn.Linear(embed_dim, num_class)
-        self.init_weights()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, sparse=False)
+        # self.attn = MultiHeadAttention(in_features=embed_dim, head_num=8)
+        self.attn = Attention(9, 3, device)
+        self.convs = nn.ModuleList(
+            [nn.Conv2d(1, num_filters, (k, embed_dim)) for k in filter_sizes]
+        )
+        self.fc = nn.Linear(num_filters * len(filter_sizes), num_class)
 
-    def init_weights(self):
-        initrange = 0.5
-        self.embedding.weight.data.uniform_(-initrange, initrange)
-        self.fc.weight.data.uniform_(-initrange, initrange)
-        self.fc.bias.data.zero_()
+    def conv_and_pool(self, x, conv):
+        x = F.relu(conv(x)).squeeze(3)
+        x = F.max_pool1d(x, x.size(2)).squeeze(2)
+        return x
 
-    def forward(self, text, offsets):
-        embedded = self.embedding(text, offsets)
-        embedded = self.attn(embedded, embedded, embedded)
-        return self.fc(embedded)
+    def forward(self, text):
+        embedded = self.embedding(text[0])
+        embedded = embedded.unsqueeze(1)
+        out = torch.cat([self.conv_and_pool(embedded, conv) for conv in self.convs], 1)
+        embedded = self.attn(out, out, out)
+        return self.fc(out)

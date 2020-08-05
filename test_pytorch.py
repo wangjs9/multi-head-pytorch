@@ -1,99 +1,131 @@
 import torch
+import numpy as np
 from attention_pytorch import *
-
-import torchtext
-from torchtext.datasets import text_classification
-from torch.utils.data import DataLoader
-from torch.utils.data.dataset import random_split
-
-def generate_batch(batch):
-    label = torch.tensor([entry[0] for entry in batch])
-    text = [entry[1] for entry in batch]
-    offsets = [0] + [len(entry) for entry in text]
-    offsets = torch.tensor(offsets[:-1]).cumsum(dim=0)
-    text = torch.cat(text)
-    return text, offsets, label
-
+from torchtext import data
+from sklearn import metrics
+from tensorboardX import SummaryWriter
+import time
+from utils import get_time_dif
 import os
-if not os.path.isdir('./.data'):
-    os.mkdir('./.data')
-train_dataset, test_dataset = text_classification.DATASETS['AG_NEWS'](
-    root='./.data', vocab=None)
 
-train_len = int(len(train_dataset) * 0.95)
+learning_rate = 0.05
+num_epochs = 3
+require_improvement = 1000
+class_list = []
+log_path = './log'
+save_path = './.normal/model.ckpt'
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 16
-VOCAB_SIZE = len(train_dataset.get_vocab())
-EMBED_DIM = 128
-NUN_CLASS = len(train_dataset.get_labels())
+def init_network(model, method='xavier', exclude='embedding', seed=123):
+    for name, w in model.named_parameters():
+        if exclude not in name:
+            if 'weight' in name:
+                if method == 'xavier':
+                    nn.init.xavier_normal_(w)
+                elif method == 'kaiming':
+                    nn.init.kaiming_normal_(w)
+                else:
+                    nn.init.normal_(w)
+            elif 'bias' in name:
+                nn.init.constant_(w, 0)
+            else:
+                pass
 
-#model_name = "./.normal"
-#model = TextSentiment(VOCAB_SIZE, EMBED_DIM, NUN_CLASS).to(device)
+def train(model, train_iter, dev_iter, test_iter):
+    start_time = time.time()
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    total_batch = 0
+    dev_best_loss = float('inf')
 
-model_name = "./.attention"
-model = TextSentiment_attn(VOCAB_SIZE, EMBED_DIM, NUN_CLASS, device).to(device)
+    if os.path.exists(save_path):
+        model.load_state_dict(torch.load(save_path)['model_state_dict'])
 
-criterion = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.SGD(model.parameters(), lr=4.0)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.9)
+    model.train()
 
-sub_train_, sub_valid_ = \
-    random_split(train_dataset, [train_len, len(train_dataset) - train_len])
+    param_optimizer = list(model.named_parameters())
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
+    if os.path.exists(save_path):
+        optimizer.load_state_dict(torch.load(save_path)['optimizer_state_dict'])
 
-data = DataLoader(sub_train_, batch_size=BATCH_SIZE, shuffle=True,
-                      collate_fn=generate_batch)
+    writer = SummaryWriter(log_dir=log_path + '/' + time.strftime('%m-%d_%H.%M', time.localtime()))
 
+    for epoch in range(num_epochs):
+        print('Epoch [{}/{}]'.format(epoch + 1, num_epochs))
 
-def train_func(sub_train_):
-    # 训练模型
-    train_loss = 0
-    train_acc = 0
-    data = DataLoader(sub_train_, batch_size=BATCH_SIZE, shuffle=True,
-                      collate_fn=generate_batch)
-    for i, (text, offsets, cls) in enumerate(data):
-        optimizer.zero_grad()
-        text, offsets, cls = text.to(device), offsets.to(device), cls.to(device)
-        output = model(text, offsets)
-        loss = criterion(output, cls)
-        train_loss += loss.item()
-        loss.backward()
-        optimizer.step()
-        train_acc += (output.argmax(1) == cls).sum().item()
-        state = {
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_acc': train_acc / len(text),
-        }
-        if not os.path.exists(model_name):
-            os.makedirs(model_name)
-        torch.save(state, model_name + '/model_' + str(i) +'.pth')
-        if i % 100 == 0:
-            print('step {}: loss: {}, acc: {}'.format(i, loss.item() / len(cls), (output.argmax(1) == cls).sum().item() / len(cls)))
+        for i, (trains, labels) in enumerate(train_iter):
+            outputs = model(trains)
+            model.zero_grad()
+            loss = F.cross_entropy(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            if total_batch % 100 == 0:
+                # 每多少轮输出在训练集和验证集上的效果
+                true = labels.data.cpu()
+                predic = torch.max(outputs.data, 1)[1].cpu()
+                train_acc = metrics.accuracy_score(true, predic)
+                dev_acc, dev_loss = evaluate(model, dev_iter)
+                if dev_loss < dev_best_loss:
+                    state = {
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'dev_best_loss': dev_loss
+                    }
+                    dev_best_loss = dev_loss
+                    torch.save(state, save_path)
+                    improve = '*'
+                    last_improve = total_batch
+                else:
+                    improve = ''
+                time_dif = get_time_dif(start_time)
+                msg = 'Iter: {0:>6},  Train Loss: {1:>5.2},  Train Acc: {2:>6.2%},  Val Loss: {3:>5.2},  Val Acc: {4:>6.2%},  Time: {5} {6}'
+                print(msg.format(total_batch, loss.item(), train_acc, dev_loss, dev_acc, time_dif, improve))
+                writer.add_scalar("loss/train", loss.item(), total_batch)
+                writer.add_scalar("loss/dev", dev_loss, total_batch)
+                writer.add_scalar("acc/train", train_acc, total_batch)
+                writer.add_scalar("acc/dev", dev_acc, total_batch)
+                model.train()
+            total_batch += 1
+            if total_batch - last_improve > require_improvement:
+                # 验证集loss超过1000batch没下降，结束训练
+                print("No optimization for a long time, auto-stopping...")
+                flag = True
+                break
+    writer.close()
+    # test(model, test_iter)
 
-    # 调整学习率
-    scheduler.step()
+def evaluate(model, dev_iter, test=False):
+    model.eval()
+    loss_total = 0
+    predict_all = np.array([], dtype=int)
+    labels_all = np.array([], dtype=int)
+    with torch.no_grad():
+        for texts, labels in dev_iter:
+            outputs = model(texts)
+            loss = F.cross_entropy(outputs, labels)
+            loss_total += loss
+            labels = labels.data.cpu().numpy()
+            predic = torch.max(outputs.data, 1)[1].cpu().numpy()
+            labels_all = np.append(labels_all, labels)
+            predict_all = np.append(predict_all, predic)
 
-    return train_loss / len(sub_train_), train_acc / len(sub_train_)
+    acc = metrics.accuracy_score(labels_all, predict_all)
+    if test:
+        report = metrics.classification_report(labels_all, predict_all, target_names=class_list, digits=4)
+        confusion = metrics.confusion_matrix(labels_all, predict_all)
+        return acc, loss_total / len(dev_iter), report, confusion
+    return acc, loss_total / len(dev_iter)
 
-def test(data_):
-    loss = 0
-    acc = 0
-    data = DataLoader(data_, batch_size=BATCH_SIZE, collate_fn=generate_batch)
-    for text, offsets, cls in data:
-        text, offsets, cls = text.to(device), offsets.to(device), cls.to(device)
-        with torch.no_grad():
-            output = model(text, offsets)
-            loss = criterion(output, cls)
-            loss += loss.item()
-            acc += (output.argmax(1) == cls).sum().item()
-
-    return loss / len(data_), acc / len(data_)
-
-if os.path.exists(model_name):
-    checkpoint = torch.load(os.walk(model_name)[-1])
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    dev_best_loss = checkpoint['dev_best_loss']
-
-train_func(sub_train_)
+def test(model, test_iter):
+    model.load_state_dict(torch.load(save_path))
+    model.eval()
+    start_time = time.time()
+    test_acc, test_loss, test_report, test_confusion = evaluate(model, test_iter, test=True)
+    msg = 'Test Loss: {0:>5.2},  Test Acc: {1:>6.2%}'
+    print(msg.format(test_loss, test_acc))
+    print("Precision, Recall and F1-Score...")
+    print(test_report)
+    print("Confusion Matrix...")
+    print(test_confusion)
